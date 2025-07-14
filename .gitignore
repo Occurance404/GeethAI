@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+
+# Data
+Downloaded_Audio/
+
+# Cache
+huggingface_cache/
+
+# IDEs
+.idea/
+.vscode/
