@@ -12,7 +12,7 @@ from transformers import (
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 # --- Configuration ---
-BASE_MODEL_NAME = "google/gemma-2-9b-it"  # A powerful, modern base model
+BASE_MODEL_NAME = "google/gemma-3-4b-it"  # A powerful, modern base model
 DATASET_FILE = "lyrics_dataset.txt"
 OUTPUT_DIR = "kavi_finetuned_model"
 NUM_TRAIN_EPOCHS = 3
