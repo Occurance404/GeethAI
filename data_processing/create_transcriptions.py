@@ -1,108 +1,106 @@
 import torch
 from transformers import pipeline
 import glob
-import json
 import os
 from tqdm import tqdm
 import librosa
 
 # --- Configuration ---
-MODEL_NAME = "openai/whisper-base"
+MODEL_NAME = "openai/whisper-large-v3"
 AUDIO_DIR = "Downloaded_Audio"
+OUTPUT_FILE = "lyrics_dataset.txt"
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 SAMPLING_RATE = 16000
+# This marker helps us track which files have been successfully processed.
+PROGRESS_MARKER_PREFIX = "---Processed-File:"
 
-def format_timestamp(seconds):
-    """Converts seconds to HH:MM:SS.mmm format."""
-    if seconds is None:
-        return "00:00:00.000"
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    milliseconds = int((seconds - int(seconds)) * 1000)
-    return f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}.{milliseconds:03}"
+def get_already_processed_files(output_file_path):
+    """
+    Reads the output file to find which files have already been transcribed
+    by looking for the progress marker. This allows the script to be restartable.
+    """
+    processed_files = set()
+    if not os.path.exists(output_file_path):
+        return processed_files
+    
+    with open(output_file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.startswith(PROGRESS_MARKER_PREFIX):
+                # Extract the filename from the marker line
+                filename = line.strip().split(PROGRESS_MARKER_PREFIX)[1].strip()
+                processed_files.add(filename)
+    return processed_files
 
 def main():
     """
-    Generates timestamped transcriptions for all .wav files in the audio directory
-    using a chunked pipeline for efficiency and handling long audio.
+    Generates a single, consolidated text file of lyrics.
+    This script is restartable and will skip files that have already been processed.
     """
-    print(f"Initializing pipeline with model: {MODEL_NAME} on device: {DEVICE}")
+    print("Initializing script...")
     
+    # --- Step 1: Setup the transcription pipeline ---
+    print(f"Initializing pipeline with model: {MODEL_NAME} on device: {DEVICE}")
     pipe = pipeline(
         "automatic-speech-recognition",
         model=MODEL_NAME,
         torch_dtype=torch.float16,
         device=DEVICE,
+        model_kwargs={},
     )
 
+    # --- Step 2: Find all audio files ---
     search_path = os.path.join(AUDIO_DIR, "**", "*.wav")
-    audio_files = glob.glob(search_path, recursive=True)
-    
-    if not audio_files:
+    all_audio_files = glob.glob(search_path, recursive=True)
+    if not all_audio_files:
         print(f"No .wav files found in {AUDIO_DIR}. Exiting.")
         return
 
-    print(f"Found {len(audio_files)} .wav files to process.")
+    # --- Step 3: Determine which files to skip (Resume Logic) ---
+    processed_files = get_already_processed_files(OUTPUT_FILE)
+    files_to_process = [f for f in all_audio_files if os.path.basename(f) not in processed_files]
+    
+    print(f"Found {len(all_audio_files)} total files.")
+    if processed_files:
+        print(f"Found {len(processed_files)} already processed files. Skipping them.")
+    print(f"Processing {len(files_to_process)} new files.")
 
-    for file_path in tqdm(audio_files, desc="Processing files"):
+    if not files_to_process:
+        print("No new files to process. Exiting.")
+        return
+
+    # --- Step 4: Process each new file ---
+    for file_path in tqdm(files_to_process, desc="Transcribing files"):
         try:
-            # Load the entire audio file, resample to 16kHz, and convert to mono
             audio_input, _ = librosa.load(file_path, sr=SAMPLING_RATE, mono=True)
 
-            # Process the entire file at once; the pipeline handles chunking
             output = pipe(
                 audio_input,
-                chunk_length_s=30,  # Use 30s chunks, standard for Whisper
-                stride_length_s=5,   # Add a 5s overlap for better context
+                chunk_length_s=30,
+                stride_length_s=5,
                 generate_kwargs={"language": "telugu"},
-                return_timestamps="word",
+                return_timestamps=False,
             )
 
-            if not output or not output.get("chunks"):
+            clean_text = output["text"].strip() if output and output.get("text") else ""
+
+            if not clean_text:
                 print(f"Warning: No transcription generated for {file_path}")
                 continue
 
-            full_text = output["text"].strip()
-            all_words = []
-            for word in output["chunks"]:
-                if word.get("timestamp"):
-                    start_time, end_time = word["timestamp"]
-                    # The pipeline might return None for timestamps of padding/special tokens
-                    if start_time is not None and end_time is not None:
-                        all_words.append({
-                            "text": word["text"],
-                            "start_time": format_timestamp(start_time),
-                            "end_time": format_timestamp(end_time)
-                        })
-
-            if not all_words:
-                print(f"Warning: No words with timestamps found for {file_path}")
-                continue
-
-            # The overall start and end times are simply the first and last word's times
-            start_time_overall = all_words[0]["start_time"]
-            end_time_overall = all_words[-1]["end_time"]
-
-            transcription_data = {
-                "title": os.path.splitext(os.path.basename(file_path))[0],
-                "full_text": full_text,
-                "segments": [{
-                    "start_time": start_time_overall,
-                    "end_time": end_time_overall,
-                    "text": full_text
-                }],
-                "words": all_words
-            }
-
-            json_filename = os.path.splitext(file_path)[0] + ".json"
-            with open(json_filename, 'w', encoding='utf-8') as f:
-                json.dump(transcription_data, f, ensure_ascii=False, indent=4)
+            # --- Step 5: Save progress immediately ---
+            # We write the transcription and then a marker line with the filename.
+            # This makes our process robust and restartable.
+            with open(OUTPUT_FILE, 'a', encoding='utf-8') as f:
+                f.write(clean_text)
+                f.write("\n\n---\n\n")
+                f.write(f"{PROGRESS_MARKER_PREFIX} {os.path.basename(file_path)}\n")
 
         except Exception as e:
-            print(f"Error processing file {file_path}: {e}")
+            print(f"ERROR processing file {file_path}: {e}")
+            print("This file will be skipped. Progress on other files is saved.")
             continue
 
-    print("Transcription generation complete.")
+    print(f"Transcription generation complete. Dataset saved to {OUTPUT_FILE}.")
 
 if __name__ == "__main__":
     main()

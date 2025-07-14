@@ -16,3 +16,8 @@ huggingface_cache/
 # IDEs
 .idea/
 .vscode/
+
+# Output files
+*.txt
+*.log
+logs/

@@ -1,71 +1,109 @@
 import os
 import torch
+import argparse
+from datasets import Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     Trainer,
     TrainingArguments,
-    TextDataset,
     DataCollatorForLanguageModeling,
 )
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 # --- Configuration ---
-MODEL_NAME = "google/gemma-3-12b-it"
-DATASET_FILE = "/home/system613-43/DoNootTouch/model/kavi_dataset.txt"
-OUTPUT_DIR = "/home/system613-43/DoNootTouch/model/kavi_finetuned_model"
+BASE_MODEL_NAME = "google/gemma-2-9b-it"  # A powerful, modern base model
+DATASET_FILE = "lyrics_dataset.txt"
+OUTPUT_DIR = "kavi_finetuned_model"
 NUM_TRAIN_EPOCHS = 3
-PER_DEVICE_TRAIN_BATCH_SIZE = 1 # Keep this low for large models
-SAVE_STEPS = 500 # Save a checkpoint every 500 steps
+PER_DEVICE_TRAIN_BATCH_SIZE = 1 # Keep low for large models and LoRA
+SAVE_STEPS = 500
 
-def main():
+def load_lyrics_dataset(file_path, tokenizer, is_dummy_run=False):
     """
-    Main function to run the fine-tuning process for the Kavi model.
-    """
-    print("--- Starting Kavi Model Fine-Tuning ---")
-
-    # --- Step 1: Verify Dataset ---
-    if not os.path.exists(DATASET_FILE) or os.path.getsize(DATASET_FILE) == 0:
-        print(f"ERROR: Dataset file not found or is empty at: {DATASET_FILE}")
-        print("Please run 'assemble_kavi_dataset.py' first to create the dataset.")
-        return
-
-    print(f"Using dataset: {DATASET_FILE}")
-    print(f"Model will be saved to: {OUTPUT_DIR}")
-
-    # --- Step 2: Load Tokenizer and Model ---
-    print(f"Loading tokenizer and model for '{MODEL_NAME}'...")
+    Loads the consolidated lyrics dataset from a text file.
     
-    # Load the tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    # Set a padding token if it doesn't exist. EOS token is a good choice for GPT-like models.
+    Args:
+        file_path (str): The path to the lyrics_dataset.txt file.
+        tokenizer: The model's tokenizer.
+        is_dummy_run (bool): If True, only loads the first 30 entries.
+
+    Returns:
+        A Hugging Face Dataset object ready for training.
+    """
+    print(f"Loading dataset from: {file_path}")
+    with open(file_path, 'r', encoding='utf-8') as f:
+        full_text = f.read()
+    
+    # Split the text into individual lyrics using our separator
+    # We also filter out any empty strings that might result from the split
+    lyrics = [lyric.strip() for lyric in full_text.split("\n\n---\n\n") if lyric.strip()]
+    
+    if is_dummy_run:
+        print("--- DUMMY RUN ENABLED: Using only the first 30 lyrics. ---")
+        lyrics = lyrics[:30]
+
+    if not lyrics:
+        raise ValueError("No lyrics found in the dataset file. Please check the file and separator.")
+
+    print(f"Loaded {len(lyrics)} lyrics for the dataset.")
+    
+    # Create a Hugging Face Dataset object
+    dataset = Dataset.from_dict({"text": lyrics})
+    
+    # Tokenize the dataset
+    def tokenize_function(examples):
+        return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=512)
+        
+    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+    return tokenized_dataset
+
+def main(args):
+    """
+    Main function to run the fine-tuning process for the Kavi model using LoRA.
+    """
+    print("--- Starting Kavi Model Fine-Tuning (with LoRA) ---")
+
+    # --- Step 1: Load Tokenizer and Model ---
+    print(f"Loading tokenizer and base model for '{BASE_MODEL_NAME}'...")
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load the model
-    # We use bfloat16 to reduce memory usage and speed up training on compatible GPUs.
+    # Load the model with quantization for memory efficiency
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
+        BASE_MODEL_NAME,
         torch_dtype=torch.bfloat16,
-        device_map="auto", # Automatically distribute the model across available GPUs
+        device_map="auto",
+        quantization_config=None, # Can add BitsAndBytesConfig for 4-bit quantization if needed
     )
-    print("Model and tokenizer loaded successfully.")
+    print("Base model and tokenizer loaded successfully.")
 
-    # --- Step 3: Prepare Dataset and Collator ---
-    print("Preparing dataset for training...")
+    # --- Step 2: Configure LoRA ---
+    print("Configuring model for LoRA (Parameter-Efficient Fine-Tuning)...")
+    # First, prepare the model for k-bit training (even if not using it, it's good practice)
+    model = prepare_model_for_kbit_training(model)
+
+    lora_config = LoraConfig(
+        r=16,  # Rank of the update matrices. Higher rank means more parameters to train.
+        lora_alpha=32,  # Alpha parameter for scaling.
+        target_modules=["q_proj", "v_proj"],  # Target modules to apply LoRA to.
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
     
-    # The TextDataset handles reading the text file and preparing it for the model.
-    train_dataset = TextDataset(
-        tokenizer=tokenizer,
-        file_path=DATASET_FILE,
-        block_size=128, # The block size for text sequences
-    )
+    model = get_peft_model(model, lora_config)
+    print("LoRA configured. Trainable parameters:")
+    model.print_trainable_parameters()
 
-    # The DataCollatorForLanguageModeling handles creating batches of data for training.
+    # --- Step 3: Prepare Dataset ---
+    train_dataset = load_lyrics_dataset(DATASET_FILE, tokenizer, args.dummy_run)
+    
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
-        mlm=False, # We are doing Causal Language Modeling, not Masked Language Modeling
+        mlm=False,
     )
-    print(f"Dataset prepared with {len(train_dataset)} examples.")
 
     # --- Step 4: Configure Training ---
     print("Configuring training arguments...")
@@ -75,10 +113,10 @@ def main():
         num_train_epochs=NUM_TRAIN_EPOCHS,
         per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
         save_steps=SAVE_STEPS,
-        save_total_limit=2, # Only keep the last 2 checkpoints
-        prediction_loss_only=True,
+        save_total_limit=2,
         logging_dir='./logs',
-        logging_steps=100,
+        logging_steps=50,
+        report_to="none", # Disable wandb or other reporting for now
     )
 
     # --- Step 5: Initialize and Run Trainer ---
@@ -94,11 +132,18 @@ def main():
     trainer.train()
     print("--- Training Complete ---")
 
-    # --- Step 6: Save the Final Model ---
-    print("Saving the final fine-tuned model...")
+    # --- Step 6: Save the Final LoRA Adapters ---
+    print("Saving the final fine-tuned LoRA adapters...")
     trainer.save_model(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
-    print(f"Model saved to {OUTPUT_DIR}")
+    # The tokenizer is saved automatically by the Trainer in this setup
+    print(f"Model adapters saved to {OUTPUT_DIR}")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Fine-tune the Kavi lyrics model with LoRA.")
+    parser.add_argument(
+        "--dummy_run",
+        action="store_true",
+        help="If set, runs the training on a small subset of the data for testing."
+    )
+    args = parser.parse_args()
+    main(args)
